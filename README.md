@@ -26,4 +26,4 @@ One folder per challenge, added as I go.
 
 ## Notes
 
-Written for learning, not for production: the point is to see where consistency, availability and partition tolerance actually collide.
+Written for learning, not for production: the point is to see where consistency, availability and partition tolerance actually collide. to consolidate concepts of Desgining data-intensive applications of Martin Kleppmann
