@@ -1,6 +1,74 @@
 command to break :
 
+da wsl 
+
 cd ~/maelstrom
 ./maelstrom test -w unique-ids --bin ~/go/bin/maelstrom-unique-ids \
   --time-limit 60 --rate 30000 --concurrency 200 --node-count 1
 w
+
+theory 
+
+                 ┌─────────── processo JVM "maelstrom" ────────────┐
+   client c1 ────┤  thread clienti → rete interna → smistamento     │
+   client c2 ────┤  per "dest" (n0/n1/n2)                            │
+   client c3 ────┤                                                 │
+                 └───┬──────────────┬──────────────┬───────────────┘
+          stdin/stdout│     stdin/stdout│    stdin/stdout│
+                 ┌───▼──────┐   ┌───▼──────┐   ┌───▼──────┐
+                 │ PROcESSO │   │ PROCESSO │   │ PROCESSO │
+                 │ n0       │   │ n1       │   │ n2       │
+                 │ main→Run │   │ main→Run │   │ main→Run │
+                 │ counter  │   │ counter  │   │ counter  │
+                 │ handlers │   │ handlers │   │ handlers │
+                 └──────────┘   └──────────┘   └──────────┘
+                     memoria separata, goroutine separate, nessuno stato condiviso
+
+
+
+processo n0
+├── goroutine main            ← esegue main() e poi il loop di Run(): legge stdin, avvia gli handler
+│      go handleMessage(msg)  ← per ogni riga: crea una goroutine e prosegue subito
+│
+├── goroutine handler #1  ─┐
+├── goroutine handler #2  ─┤  create a volontà, lo scheduler Go le piazza
+├── goroutine handler #3  ─┘  sui thread OS del processo (non legate a un thread fisso)
+└── ... (muoiono quando l'handler ritorna)
+
+
+
+
+processo n0 (1 processo, 4 thread OS)
+├─ thread 1 ── goroutine handler msg#41   ← in esecuzione
+├─ thread 2 ── goroutine handler msg#42   ← in esecuzione, stesso istante
+├─ thread 3 ── goroutine handler msg#43   ← bloccata sulla write di stdout (mutex)
+├─ thread 4 ── (libero)
+└─ goroutine di Run() ── bloccata su read(stdin)
+
+
+Quello che vuoi è la legge di scala.
+
+La formula (d'ordine di grandezza)
+Un duplicato si produce quando due handler hanno letto lo stesso valore del contatore prima che uno dei due lo incrementi. Con arrivi indipendenti:
+
+duplicati attesi ≈ operazioni × (λ · w)
+
+λ = handler completati al secondo nel processo   (throughput reale del nodo)
+w = finestra "vulnerabile": tempo tra la lettura e la scrittura del counter
+
+Due conseguenze immediate:
+
+lineare nelle operazioni (più a lungo giri, più occasioni);
+lineare in λ — quindi, a parità di durata, quadratica nel tempo: ops = λ·T → attesi ≈ λ²·T·w. Raddoppi il throughput, quadruplichi i duplicati.
+
+Applicata ai due casi
+Con w ≈ 50 ns (Itoa + concatenazione + creazione mappa, che stanno tra le due righe):
+
+Scenario
+λ (ops/s)
+Operazioni
+λ·w
+Duplicati attesi
+demo 8 goroutine (160k)	~5·10⁷	160.000	~2,5	saturazione → 12.548 osservati
+il tuo nodo, --concurrency 3	~1,2·10³	34.436	~6·10⁻⁵	2 (attesi; 0 osservati = dentro il rumore)
+il tuo nodo, --concurrency 100	~2·10⁴ (stima)	~600.000	~1·10⁻³	~600
