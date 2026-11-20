@@ -1,0 +1,6 @@
+command to break :
+
+cd ~/maelstrom
+./maelstrom test -w unique-ids --bin ~/go/bin/maelstrom-unique-ids \
+  --time-limit 60 --rate 30000 --concurrency 200 --node-count 1
+w
