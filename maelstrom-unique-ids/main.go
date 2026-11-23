@@ -1,29 +1,29 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"sync/atomic"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
 func main() {
 
-	counter := 0
+	counter := &atomic.Int64{}
 
 	n := maelstrom.NewNode()
 
 	n.Handle("generate", func(msg maelstrom.Message) error {
 
-		id := n.ID() + "-" + strconv.Itoa(counter)
+		id := fmt.Sprintf("%s-%d", n.ID(), counter.Add(1))
 
 		body := map[string]any{
 			"type": "generate_ok",
 			"id":   id,
 		}
 
-		counter++
 		return n.Reply(msg, body)
 	})
 
