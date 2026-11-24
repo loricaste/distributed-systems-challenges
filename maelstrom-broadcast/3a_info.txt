@@ -1,0 +1,182 @@
+the 3a part is one node only. Just to make seal the contract , not to push. 
+The target is to create the 3 correct handlers for the node
+
+NewNode costruisce l'oggetto, Handle registra una funzione in una mappa di dispatch. Nessuno dei due esegue nulla.
+
+maelstrom.NewNode() — il costruttore
+func NewNode() *Node {
+	return &Node{
+		handlers:  make(map[string]HandlerFunc),
+		callbacks: make(map[int]HandlerFunc),
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+	}
+}
+Inizializza quattro cose e restituisce il puntatore:
+
+Campo:                  A cosa serve:
+handlers	            mappa tipo messaggio → funzione: l'indice che Run() consulterà
+callbacks	            mappa msg_id → funzione: le risposte attese dalle RPC() (vuota finché non ne fai)
+Stdin / Stdout	        i veri fd del processo: da lì arrivano e partono i JSON con Maelstrom
+
+Nessun I/O, nessuna goroutine: è solo la struttura dati che stai per configurare. Restituisce *Node perché contiene un sync.Mutex e un sync.WaitGroup — copiarla sarebbe un bug, quindi si passa sempre per puntatore.
+
+
+
+n.Handle(tipo, fn) — la registrazione
+// Handle registers a message handler for a given message type. Will panic if
+// registering multiple handlers for the same message type.
+func (n *Node) Handle(typ string, fn HandlerFunc) {
+	if _, ok := n.handlers[typ]; ok {
+		panic(fmt.Sprintf("duplicate message handler for %q message type", typ))
+	}
+	n.handlers[typ] = fn
+}
+
+
+È un'assegnazione in mappa, nient'altro. Tre conseguenze:
+
+Non esegue fn: la funzione parte solo quando arriva un messaggio con quel type, dentro Run().
+Un handler per tipo: due Handle("generate", …) fanno panic all'avvio — è una protezione contro la registrazione accidentale doppia.
+Match esatto e case-sensitive: "generate" ≠ "Generate". Se sbagli, Run() risponde No handler for … e il processo termina.
+
+Il collegamento: Run()
+
+if body.InReplyTo != 0 {        // è una risposta a una tua RPC → callbacks
+    h := n.callbacks[body.InReplyTo]
+    …
+} else {                        // è una richiesta → dispatch per type
+    h := n.handlers[body.Type]
+    go h(msg)                   // una goroutine per messaggio
+}
+
+Quindi la catena nel tuo main.go è:
+
+NewNode() → oggetto con mappa vuota
+Handle(…) → mappa popolata (configurazione, prima di Run)
+Run() → loop bloccante: legge stdin, guarda body.Type, go h(msg)
+
+Per broadcast ti serviranno tre Handle ("broadcast", "read", "topology"), tutti registrati prima di Run(): dopo, il loop non ti ridà il controllo fino a EOF.
+
+
+
+Dove cade ogni pezzo
+Riquadro dello schema       Riga di codice                                               cosa fa lì
+riquadro JVM in alto	      —	                                                         exec del binario, crea le pipe, instrada per dest
+frecce stdin/stdout	         n.Stdin = os.Stdin, n.Stdout = os.Stdout (dentro NewNode)	 sono esattamente quelle due pipe
+PROCESSO n0 … main→Run	     main() → NewNode() → Handle(…) → Run()	                     tutto qui dentro
+riquadro handlers	         la mappa riempita da Handle	                             map[string]HandlerFunc
+riquadro counter	         il tuo stato (atomic.Int64, o map+Mutex in broadcast)	     condiviso tra goroutine dello stesso processo
+goroutine main	             n.Run()	                                                 stessa goroutine di main, che ci resta bloccata
+goroutine handler #1…#N	     go h(msg) dentro Run	                                     una per messaggio, muoiono al ritorno
+
+
+Lo stesso schema, annotato col codice
+┌───────────── JVM "maelstrom" ─────────────┐
+│ client c1..c3 → rete interna → routing per dest │
+└───┬──────────────┬──────────────┬─────────┘
+    │ pipe         │ pipe         │ pipe        ← questi sono n.Stdin / n.Stdout
+┌───▼──────────┐ ┌──▼───────────┐ ┌─▼────────────┐
+│ PROCESSO n0  │ │ PROCESSO n1  │ │ PROCESSO n2  │
+│              │ │              │ │              │
+│ main()       │ │ main()       │ │ main()       │   ← 3 processi, stesso binario
+│  NewNode()   │ │  NewNode()   │ │  NewNode()   │   → handlers={}, callbacks={}
+│  Handle("broadcast", f)        │ │              │   → popola la mappa "handlers"
+│  Handle("read", g)             │ │              │
+│  Handle("topology", h)         │ │              │
+│  Run()  ◄── la "goroutine main" del tuo 2° schema
+│   loop: riga → body.Type → handlers[type] → go h(msg)
+│              │ │              │ │              │
+│ counter      │ │ counter      │ │ counter      │   ← stato per-processo
+└──────────────┘ └──────────────┘ └──────────────┘
+
+
+--node-count 3
+   → il JVM esegue il tuo binario 3 volte: processo n0, processo n1, processo n2
+   → ognuno dei 3 ha il proprio main():
+         NewNode()   → 1 oggetto Node per processo
+         Handle(…)   → 3 handler per processo (broadcast, read, topology)
+         Run()       → 1 loop per processo
+
+
+Il legame è: N processi, e per ognuno esattamente 1 NewNode. Non esiste un comando per "fare più Node nello stesso processo": se chiamassi NewNode() due volte nello stesso main avresti due oggetti che leggono lo stesso stdin, e il secondo Run() ruberebbe messaggi al primo.
+
+Cosa                  Livello                                      Chi lo decide
+--node-count 3	      processi OS (n0, n1, n2)	                   la riga di comando
+NewNode()	          1 oggetto per processo	                   il tuo main.go
+Handle(…)	          1 voce di mappa per tipo, per processo	   il tuo main.go
+Run()	              1 loop per processo, blocca fino a EOF	   il tuo main.go
+--concurrency 3	      thread client dentro la JVM	               la riga di comando
+
+
+--node-count 3        →  3 processi OS
+                              │
+                              ├── processo n0
+                              │     ├── goroutine main        (main() → Run(), 1 fissa)
+                              │     ├── goroutine handler #1  ┐
+                              │     ├── goroutine handler #2  ├ create da go h(msg)
+                              │     └── ...                   ┘  una per messaggio in volo
+                              ├── processo n1  (idem)
+                              └── processo n2  (idem)
+
+
+Run() non è un'altra goroutine e non è un processo: è un metodo che main() chiama, e da lì in poi main ci resta dentro. Stessa goroutine, esecuzione sequenziale.
+
+func main() {
+    n := maelstrom.NewNode()      // 1. costruzione
+    n.Handle("broadcast", …)      // 2. configurazione (nessuno legge stdin)
+    if err := n.Run(); err != nil { log.Fatal(err) }   // 3. blocco qui
+}                                                     // 4. return → exit 0
+
+
+Run è il produttore delle goroutine handler: una per messaggio, e non le aspetta.
+
+
+for scanner.Scan() {
+    …
+    h := n.handlers[body.Type]        // oppure init / callback
+    n.wg.Add(1)
+    go func() {                        // ← nasce la goroutine handler
+        defer n.wg.Done()
+        n.handleMessage(h, msg)
+    }()
+    // e il loop prosegue SUBITO con la riga successiva
+}
+n.wg.Wait()                            // ← solo a EOF le aspetta tutte
+
+goroutine main (dentro Run)
+  │
+  ├─ riga 1 → h=… → go handler#1 ──► lavora …
+  ├─ riga 2 → h=… → go handler#2 ──► lavora …
+  ├─ riga 3 → h=… → go handler#3 ──► lavora …
+  │  (il loop non aspetta nessuno: concorrenza)
+  │
+  ├─ … EOF …
+  └─ wg.Wait() ──► aspetta #1 #2 #3 … ──► return
+
+
+"Messaggio in volo" = un messaggio che è arrivato ma non è stato ancora risposto. 
+
+La relazione con la latenza è la legge di Little:
+
+messaggi in volo  =  throughput  ×  latenza
+
+
+
+comandi alla fine 
+
+cd /mnt/c/Users/utente/Progetti/distributed-systems-challenges/maelstrom-broadcast
+go mod init maelstrom-broadcast
+go mod tidy
+go vet ./...
+go build -o ~/go/bin/maelstrom-broadcast .
+
+
+cd ~/maelstrom
+./maelstrom test -w broadcast --bin ~/go/bin/maelstrom-broadcast --node-count 1 --time-limit 20 --rate 10
+
+
+
+go vet è l'analizzatore statico che esce con Go. Legge il codice senza compilarlo né eseguirlo e segnala errori probabili che il compilatore accetta tranquillamente.
+
+./... è il pattern dei package: . = la cartella corrente, ... = "e tutte le sottocartelle". Quindi go vet ./... controlla tutti i package del modulo in cui ti trovi. Senza argomenti controlla solo il package corrente.
