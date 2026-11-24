@@ -33,7 +33,7 @@ func main() {
 		}
 
 		mu.Lock()
-		storedMessages[counter.Add(1)] = msg.message
+		storedMessages[counter.Add(1)] = body.Message
 		mu.Unlock()
 
 		return n.Reply(msg, map[string]any{
@@ -51,11 +51,11 @@ func main() {
 		mu.Unlock()
 
 		body := map[string]any{
-			"type": "read_ok",
-			"id":   receivedMessages,
+			"type":     "read_ok",
+			"messages": receivedMessages,
 		}
 
-		return n.Reply(body)
+		return n.Reply(msg, body)
 	})
 
 	n.Handle("topology", func(msg maelstrom.Message) error {
