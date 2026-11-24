@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"sync"
@@ -23,22 +24,27 @@ func main() {
 
 	n.Handle("broadcast", func(msg maelstrom.Message) error {
 
+		var body struct {
+			Message int `json:"message"`
+		}
+
+		if err := json.Unmarshal(msg.Body, &body); err != nil {
+			return err
+		}
+
 		mu.Lock()
 		storedMessages[counter.Add(1)] = msg.message
 		mu.Unlock()
 
-		body := map[string]any{
+		return n.Reply(msg, map[string]any{
 			"type": "broadcast_ok",
-		}
-
-		return n.Reply(body)
+		})
 	})
 
 	n.Handle("read", func(msg maelstrom.Message) error {
 
-		receivedMessages := []any{}
-
 		mu.Lock()
+		receivedMessages := []any{}
 		for _, value := range storedMessages {
 			receivedMessages = append(receivedMessages, value)
 		}
